@@ -19,8 +19,9 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/addrs"
-	"github.com/hashicorp/terraform/configs/configschema"
 	"github.com/hashicorp/terraform/configs"
+	"github.com/hashicorp/terraform/configs/configschema"
+	"github.com/hashicorp/terraform/states"
 	"github.com/hashicorp/terraform/tfdiags"
 )
 
@@ -86,10 +87,18 @@ func TestContext2Apply_unstable(t *testing.T) {
 		t.Fatalf("unexpected error during Plan: %s", diags.Err())
 	}
 
-	md := plan.Diff.RootModule()
-	rd := md.Resources["test_resource.foo"]
-
-	randomVal := rd.Attributes["random"].New
+	addr := addrs.Resource{
+		Mode: addrs.ManagedResourceMode,
+		Type: "test_resource",
+		Name: "foo",
+	}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance)
+	schema := p.GetSchemaReturn.ResourceTypes["test_resource"] // automatically available in mock
+	rds := plan.Changes.ResourceInstance(addr)
+	rd, err := rds.Decode(schema.ImpliedType())
+	if err != nil {
+		t.Fatal(err)
+	}
+	randomVal := rd.After.GetAttr("random").AsString()
 	t.Logf("plan-time value is %q", randomVal)
 
 	state, diags := ctx.Apply()
@@ -97,13 +106,15 @@ func TestContext2Apply_unstable(t *testing.T) {
 		t.Fatalf("unexpected error during Apply: %s", diags.Err())
 	}
 
-	mod := state.RootModule()
+	mod := state.Module(addr.Module)
+	rss := state.ResourceInstance(addr)
+
 	if len(mod.Resources) != 1 {
 		t.Fatalf("wrong number of resources %d; want 1", len(mod.Resources))
 	}
 
-	rs := mod.Resources["test_resource.foo"].Primary
-	if got, want := rs.Attributes["random"], randomVal; got != want {
+	rs, err := rss.Current.Decode(schema.ImpliedType())
+	if got, want := rs.Value.GetAttr("random").AsString(), randomVal; got != want {
 		// FIXME: We actually currently have a bug where we re-interpolate
 		// the config during apply and end up with a random result, so this
 		// check fails. This check _should not_ fail, so we should fix this
@@ -274,7 +285,7 @@ func TestContext2Apply_resourceDependsOnModuleStateOnly(t *testing.T) {
 	p := testProvider("aws")
 	p.DiffFn = testDiffFn
 
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -302,7 +313,7 @@ func TestContext2Apply_resourceDependsOnModuleStateOnly(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	{
 		// verify the apply happens in the correct order
@@ -362,7 +373,7 @@ func TestContext2Apply_resourceDependsOnModuleDestroy(t *testing.T) {
 	p := testProvider("aws")
 	p.DiffFn = testDiffFn
 
-	var globalState *State
+	var globalState *states.State
 	{
 		p.ApplyFn = testApplyFn
 		ctx := testContext2(t, &ContextOpts{
@@ -802,7 +813,7 @@ func TestContext2Apply_createBeforeDestroy(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -819,7 +830,7 @@ func TestContext2Apply_createBeforeDestroy(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -858,7 +869,7 @@ func TestContext2Apply_createBeforeDestroyUpdate(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -875,7 +886,7 @@ func TestContext2Apply_createBeforeDestroyUpdate(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -916,7 +927,7 @@ func TestContext2Apply_createBeforeDestroy_dependsNonCBD(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -943,7 +954,7 @@ func TestContext2Apply_createBeforeDestroy_dependsNonCBD(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -986,7 +997,7 @@ func TestContext2Apply_createBeforeDestroy_hook(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -1004,11 +1015,11 @@ func TestContext2Apply_createBeforeDestroy_hook(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	var actual []string
 	var actualLock sync.Mutex
-	h.PostApplyFn = func(n *InstanceInfo, s *InstanceState, e error) (HookAction, error) {
+	h.PostApplyFn = func(addr addrs.AbsResourceInstance, gen states.Generation, sv cty.Value, e error) (HookAction, error) {
 		actualLock.Lock()
 
 		defer actualLock.Unlock()
@@ -1054,7 +1065,7 @@ func TestContext2Apply_createBeforeDestroy_deposedCount(t *testing.T) {
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
 
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -1088,7 +1099,7 @@ func TestContext2Apply_createBeforeDestroy_deposedCount(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
@@ -1133,7 +1144,7 @@ func TestContext2Apply_createBeforeDestroy_deposedOnly(t *testing.T) {
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
 
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -1154,7 +1165,7 @@ func TestContext2Apply_createBeforeDestroy_deposedOnly(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
@@ -1189,7 +1200,7 @@ func TestContext2Apply_destroyComputed(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -1207,7 +1218,7 @@ func TestContext2Apply_destroyComputed(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -1244,7 +1255,7 @@ func testContext2Apply_destroyDependsOn(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -1267,7 +1278,7 @@ func testContext2Apply_destroyDependsOn(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	// Record the order we see Apply
 	var actual []string
@@ -1321,7 +1332,7 @@ func testContext2Apply_destroyDependsOnStateOnly(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -1347,7 +1358,7 @@ func testContext2Apply_destroyDependsOnStateOnly(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	// Record the order we see Apply
 	var actual []string
@@ -1401,7 +1412,7 @@ func testContext2Apply_destroyDependsOnStateOnlyModule(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: []string{"root", "child"},
@@ -1427,7 +1438,7 @@ func testContext2Apply_destroyDependsOnStateOnlyModule(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	// Record the order we see Apply
 	var actual []string
@@ -1505,7 +1516,7 @@ func TestContext2Apply_destroyData(t *testing.T) {
 	p := testProvider("null")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -1523,7 +1534,7 @@ func TestContext2Apply_destroyData(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	hook := &testHook{}
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
@@ -1575,7 +1586,7 @@ func TestContext2Apply_destroySkipsCBD(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -1595,7 +1606,7 @@ func TestContext2Apply_destroySkipsCBD(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -1623,7 +1634,7 @@ func TestContext2Apply_destroyModuleVarProviderConfig(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: []string{"root", "child"},
@@ -1637,7 +1648,7 @@ func TestContext2Apply_destroyModuleVarProviderConfig(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -1690,7 +1701,7 @@ func TestContext2Apply_destroyCrossProviders(t *testing.T) {
 }
 
 func getContextForApply_destroyCrossProviders(t *testing.T, m *configs.Config, providers map[string]ResourceProviderFactory) *Context {
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -1723,7 +1734,7 @@ func getContextForApply_destroyCrossProviders(t *testing.T, m *configs.Config, p
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config:           m,
 		ProviderResolver: ResourceProviderResolverFixed(providers),
@@ -1849,7 +1860,7 @@ func TestContext2Apply_cancel(t *testing.T) {
 
 	// Start the Apply in a goroutine
 	var applyDiags tfdiags.Diagnostics
-	stateCh := make(chan *State)
+	stateCh := make(chan *states.State)
 	go func() {
 		state, diags := ctx.Apply()
 		applyDiags = diags
@@ -1915,7 +1926,7 @@ func TestContext2Apply_cancelBlock(t *testing.T) {
 
 	// Start the Apply in a goroutine
 	var applyDiags tfdiags.Diagnostics
-	stateCh := make(chan *State)
+	stateCh := make(chan *states.State)
 	go func() {
 		state, diags := ctx.Apply()
 		applyDiags = diags
@@ -1994,7 +2005,7 @@ func TestContext2Apply_cancelProvisioner(t *testing.T) {
 
 	// Start the Apply in a goroutine
 	var applyDiags tfdiags.Diagnostics
-	stateCh := make(chan *State)
+	stateCh := make(chan *states.State)
 	go func() {
 		state, diags := ctx.Apply()
 		applyDiags = diags
@@ -2063,7 +2074,7 @@ func TestContext2Apply_countDecrease(t *testing.T) {
 	m := testModule(t, "apply-count-dec")
 	p := testProvider("aws")
 	p.DiffFn = testDiffFn
-	s := &State{
+	s := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -2101,7 +2112,7 @@ func TestContext2Apply_countDecrease(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -2133,7 +2144,7 @@ func TestContext2Apply_countDecreaseToOneX(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	s := &State{
+	s := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -2163,7 +2174,7 @@ func TestContext2Apply_countDecreaseToOneX(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -2200,7 +2211,7 @@ func TestContext2Apply_countDecreaseToOneCorrupted(t *testing.T) {
 	p := testProvider("aws")
 	p.ApplyFn = testApplyFn
 	p.DiffFn = testDiffFn
-	s := &State{
+	s := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -2227,7 +2238,7 @@ func TestContext2Apply_countDecreaseToOneCorrupted(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -2260,7 +2271,7 @@ func TestContext2Apply_countTainted(t *testing.T) {
 	m := testModule(t, "apply-count-tainted")
 	p := testProvider("aws")
 	p.DiffFn = testDiffFn
-	s := &State{
+	s := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -2279,7 +2290,7 @@ func TestContext2Apply_countTainted(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
 		ProviderResolver: ResourceProviderResolverFixed(
@@ -2482,7 +2493,7 @@ func TestContext2Apply_moduleDestroyOrder(t *testing.T) {
 		return nil, nil
 	}
 
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -2505,7 +2516,7 @@ func TestContext2Apply_moduleDestroyOrder(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
@@ -2608,7 +2619,7 @@ func TestContext2Apply_moduleOrphanInheritAlias(t *testing.T) {
 	}
 
 	// Create a state with an orphan module
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: []string{"root", "child"},
@@ -2623,7 +2634,7 @@ func TestContext2Apply_moduleOrphanInheritAlias(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
@@ -2666,7 +2677,7 @@ func TestContext2Apply_moduleOrphanProvider(t *testing.T) {
 	}
 
 	// Create a state with an orphan module
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: []string{"root", "child"},
@@ -2680,7 +2691,7 @@ func TestContext2Apply_moduleOrphanProvider(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
@@ -2716,7 +2727,7 @@ func TestContext2Apply_moduleOrphanGrandchildProvider(t *testing.T) {
 	}
 
 	// Create a state with an orphan module that is nested (grandchild)
-	state := &State{
+	state := mustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: []string{"root", "parent", "child"},
@@ -2730,7 +2741,7 @@ func TestContext2Apply_moduleOrphanGrandchildProvider(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	ctx := testContext2(t, &ContextOpts{
 		Config: m,
@@ -9803,7 +9814,7 @@ func TestContext2Apply_scaleInMultivarRef(t *testing.T) {
 		State:            s,
 		Variables: InputValues{
 			"count": {
-				Value: cty.NumberIntVal(0),
+				Value:      cty.NumberIntVal(0),
 				SourceType: ValueFromCaller,
 			},
 		},
